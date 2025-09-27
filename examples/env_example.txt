@@ -1,0 +1,22 @@
+# Скопируйте этот файл в .env и заполните своими данными
+
+# Токены ботов Telegram
+# Получите у @BotFather в Telegram
+BOT1_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+BOT2_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+
+# Имя бота каталога (без @)
+# Например, если бот @my_catalog_bot, то пишите: my_catalog_bot
+BOT2_USERNAME=your_catalog_bot
+
+# Настройки Юкассы
+# Получите в личном кабинете yookassa.ru
+YOOKASSA_SHOP_ID=123456
+YOOKASSA_SECRET_KEY=test_ABCdefGHIjklMNOpqrsTUVwxyz
+
+# База данных (SQLite)
+DATABASE_URL=sqlite:///bot_database.db
+
+# ID администраторов (через запятую)
+# Узнайте свой ID у @userinfobot
+ADMIN_IDS=123456789,987654321

@@ -1,0 +1,32 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# OS/editor caches
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cache/
+
+# Local environment and secrets
+.env
+.env.*
+
+# Project-specific artifacts
+bot_database.db
+
+# Logs
+*.log
