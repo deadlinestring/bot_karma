@@ -2,11 +2,11 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from database import DatabaseManager, Order, Category, Title, Product, Size, ProductSize
+from database import DatabaseManager, Order, Category, Title, Product, Size, ProductSize, Settings
 from config import BOT1_TOKEN, BOT2_TOKEN, COMPANY_INFO, FAQ_ITEMS, DELIVERY_METHODS, ADMIN_IDS
 from yookassa import Configuration, Payment
 import admin_panel
@@ -24,6 +24,9 @@ router = Router()
 
 # Состояния для FSM
 class OrderStates(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_phone = State()
+    waiting_for_address = State()
     waiting_for_delivery = State()
     confirming_order = State()
 
@@ -81,6 +84,13 @@ def get_main_keyboard():
         [InlineKeyboardButton(text="🧑‍💼 Индивидуальный заказ", url=get_manager_link())]
     ])
     return keyboard
+
+def get_product_info_keyboard(product_id: int):
+    """Клавиатура для окна с описанием товара"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к размерам", callback_data=f"back_to_sizes_{product_id}")],
+        [InlineKeyboardButton(text="✖️ Закрыть", callback_data="close_info")]
+    ])
 
 # ======================
 # Каталог: клавиатуры
@@ -168,7 +178,10 @@ def get_product_sizes_keyboard(product_id: int):
             callback_data=f"add_to_cart_{product_id}_{sz.id}"
         )]
         for ps, sz in product_sizes
-    ] + [[InlineKeyboardButton(text="🔙 К товарам", callback_data=f"back_to_products_{product_id}")]])
+    ] + [
+        [InlineKeyboardButton(text="ℹ️ Подробнее", callback_data=f"product_info_{product_id}")],
+        [InlineKeyboardButton(text="🔙 К товарам", callback_data=f"back_to_products_{product_id}")]
+    ])
     return keyboard
 
 def get_delivery_keyboard():
@@ -285,10 +298,11 @@ async def process_back_to_products(callback: types.CallbackQuery):
     title_id = product.title_id
     await show_products_page(callback, title_id, page=1)
 
-@router.callback_query(F.data.startswith("product_"))
+@router.callback_query(F.data.regexp(r"^product_\d+$"))
 async def process_product(callback: types.CallbackQuery):
     """Показ товара и его размеров"""
-    product_id = int(callback.data.split("_")[1])
+    parts = callback.data.split("_")
+    product_id = int(parts[1])
     with DatabaseManager.get_session() as db:
         product = db.query(Product).filter(Product.id == product_id).first()
         product_sizes = db.query(ProductSize, Size).join(Size).filter(
@@ -327,15 +341,139 @@ async def process_product(callback: types.CallbackQuery):
             await callback.message.edit_text(product_text, reply_markup=kb)
         except Exception:
             await callback.message.answer(product_text, reply_markup=kb)
-    # Отправляем скрываемое описание (спойлер)
+    # Описание показываем по запросу (кнопка ℹ️ Подробнее)
+
+@router.callback_query(F.data.startswith("product_info_"))
+async def process_product_info(callback: types.CallbackQuery):
+    """Показывает скрываемое описание товара по запросу пользователя"""
+    product_id = int(callback.data.split("_")[2])
+    with DatabaseManager.get_session() as db:
+        product = db.query(Product).filter(Product.id == product_id).first()
+        settings = db.query(Settings).filter(Settings.id == 1).first()
+    title = f"🛍️ {product.name}\n\n" if product else ""
+    desc_text = (settings.description_text if settings and settings.description_text else PRODUCT_SPOILER_TEXT)
+    photo_id = settings.desc_photo_file_id if settings else None
+    video_id = settings.desc_video_file_id if settings else None
+    full_text = title + desc_text
+    kb = get_product_info_keyboard(product_id)
     try:
-        await callback.message.answer(PRODUCT_SPOILER_TEXT, parse_mode=ParseMode.HTML)
+        # Подтверждаем нажатие, чтобы убрать «часики»
+        try:
+            await callback.answer()
+        except Exception:
+            pass
+        # 1) Всегда отправляем текст с клавиатурой (HTML)
+        await callback.message.answer(full_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        # 2) Опционально отправляем медиа отдельными сообщениями (без клавиатуры)
+        if photo_id:
+            await callback.message.answer_photo(photo=photo_id, caption="📷 Фото")
+        if video_id:
+            await callback.message.answer_video(video=video_id, caption="🎥 Видео")
+    except Exception as e:
+        logger.error(f"Ошибка отправки описания: {e}")
+        # Попробуем отправить без HTML как простой текст
+        try:
+            await callback.message.answer(full_text, reply_markup=kb)
+            if photo_id:
+                await callback.message.answer_photo(photo=photo_id, caption="📷 Фото")
+            if video_id:
+                await callback.message.answer_video(video=video_id, caption="🎥 Видео")
+        except Exception:
+            await callback.message.answer("Описание временно недоступно.")
+
+@router.callback_query(F.data.startswith("back_to_sizes_"))
+async def process_back_to_sizes(callback: types.CallbackQuery):
+    """Возврат из окна описания к размерам для конкретного товара"""
+    product_id = int(callback.data.split("_")[3])
+    with DatabaseManager.get_session() as db:
+        product = db.query(Product).filter(Product.id == product_id).first()
+        product_sizes = db.query(ProductSize, Size).join(Size).filter(
+            ProductSize.product_id == product_id
+        ).all()
+    if not product:
+        await process_catalog(callback)
+        return
+    if not product_sizes:
+        product_text = f"""🛍️ {product.name}
+
+❌ У этого товара пока нет доступных размеров."""
+    else:
+        product_text = f"""🛍️ {product.name}
+
+📏 Выберите размер:"""
+    kb = get_product_sizes_keyboard(product_id)
+    # Если у товара есть фото — покажем карточку с фото, как в process_product
+    if getattr(product, 'photo_url', None):
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        try:
+            await callback.message.answer_photo(photo=product.photo_url, caption=product_text, reply_markup=kb)
+        except Exception:
+            # Если не удалось с фото — отправим текст
+            await callback.message.answer(product_text, reply_markup=kb)
+    else:
+        try:
+            await callback.message.edit_text(product_text, reply_markup=kb)
+        except Exception:
+            await callback.message.answer(product_text, reply_markup=kb)
+
+@router.callback_query(F.data == "close_info")
+async def process_close_info(callback: types.CallbackQuery):
+    """Закрывает сообщение с описанием"""
+    try:
+        await callback.message.delete()
     except Exception:
-        pass
+        try:
+            await callback.message.edit_text("Закрыто")
+        except Exception:
+            pass
+
+@router.message(StateFilter(OrderStates.waiting_for_name))
+async def handle_name_input(message: types.Message, state: FSMContext):
+    """Принимаем ФИО и переходим к телефону"""
+    full_name = message.text.strip()
+    if len(full_name.split()) < 2:
+        await message.answer("Пожалуйста, укажите ФИО полностью (имя и фамилия минимум).")
+        return
+    await state.update_data(customer_name=full_name)
+    await state.set_state(OrderStates.waiting_for_phone)
+    await message.answer("Теперь укажите номер телефона (в формате +7XXXXXXXXXX):")
+
+@router.message(StateFilter(OrderStates.waiting_for_phone))
+async def handle_phone_input(message: types.Message, state: FSMContext):
+    """Принимаем телефон и переходим к адресу"""
+    phone = message.text.strip().replace(" ", "")
+    # Простая валидация телефона
+    if not (phone.startswith("+7") or phone.startswith("8")) or not phone.replace("+", "").isdigit() or len(phone.replace("+", "")) not in (11, 12):
+        await message.answer("Похоже, номер неверный. Пример: +79991234567")
+        return
+    await state.update_data(customer_phone=phone)
+    await state.set_state(OrderStates.waiting_for_address)
+    await message.answer("Укажите адрес полностью с индексом (город, улица, дом, квартира, индекс):")
+
+@router.message(StateFilter(OrderStates.waiting_for_address))
+async def handle_address_input(message: types.Message, state: FSMContext):
+    """Принимаем адрес и показываем выбор доставки"""
+    address = message.text.strip()
+    if len(address) < 10:
+        await message.answer("Пожалуйста, укажите полный адрес и индекс.")
+        return
+    await state.update_data(customer_address=address)
+    data = await state.get_data()
+    # Покажем сводку и предложим варианты доставки
+    summary = "Данные для заказа сохранены:\n\n"
+    summary += f"ФИО: {data.get('customer_name')}\n"
+    summary += f"Телефон: {data.get('customer_phone')}\n"
+    summary += f"Адрес: {address}\n\n"
+    summary += "Теперь выберите способ доставки:" 
+    await state.set_state(OrderStates.waiting_for_delivery)
+    await message.answer(summary, reply_markup=get_delivery_keyboard())
 
 @router.callback_query(F.data.startswith("add_to_cart_"))
 async def process_add_to_cart(callback: types.CallbackQuery, state: FSMContext):
-    """Выбор размера → сразу переходим к расчету доставки и оплате"""
+    """Выбор размера → собираем данные покупателя → доставка → оплата"""
     parts = callback.data.split("_")
     product_id = int(parts[3])
     size_id = int(parts[4])
@@ -354,31 +492,25 @@ async def process_add_to_cart(callback: types.CallbackQuery, state: FSMContext):
             'price': size.price
         }]
     }
-    # Сохраняем в состояние и переводим в выбор доставки
+    # Сохраняем в состояние и переводим к сбору ФИО
     total_price = size.price
     discount_amount = total_price * COMPANY_INFO['discount_percent'] / 100
     await state.update_data(order_data=order_data, total_price=total_price, discount_amount=discount_amount)
-    await state.set_state(OrderStates.waiting_for_delivery)
+    await state.set_state(OrderStates.waiting_for_name)
     items_text = "Вы выбрали:\n\n"
     items_text += f"• {product.name} · {size.name}\n  Цена: {size.price} ₽\n\n"
     items_text += f"💰 Итого товаров: {total_price} ₽\n"
     items_text += f"🎁 Скидка {COMPANY_INFO['discount_percent']}%: -{discount_amount} ₽\n\n"
-    items_text += f"Хотите рассчитать доставку прямо сейчас?"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, рассчитать доставку", callback_data="calculate_delivery")],
-        [InlineKeyboardButton(text="❌ Отменить заказ", callback_data="cancel_order")],
-        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")],
-        [InlineKeyboardButton(text="🧑‍💼 Индивидуальный заказ", url=get_manager_link())]
-    ])
+    items_text += "Пожалуйста, введите ФИО полностью для оформления заказа:" 
     # Если исходное сообщение было с фото, нужно редактировать подпись, а не текст
     try:
         if getattr(callback.message, 'photo', None):
-            await callback.message.edit_caption(caption=items_text, reply_markup=keyboard)
+            await callback.message.edit_caption(caption=items_text)
         else:
-            await callback.message.edit_text(items_text, reply_markup=keyboard)
+            await callback.message.edit_text(items_text)
     except Exception:
         # Если редактирование невозможно (например, старое сообщение), отправим новое
-        await callback.message.answer(items_text, reply_markup=keyboard)
+        await callback.message.answer(items_text)
 
 @router.callback_query(F.data == "about")
 async def process_about(callback: types.CallbackQuery):
@@ -486,16 +618,10 @@ async def process_order_from_catalog(message: types.Message, state: FSMContext):
             total_price=total_price,
             discount_amount=discount_amount
         )
-        
-        await state.set_state(OrderStates.waiting_for_delivery)
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да, рассчитать доставку", callback_data="calculate_delivery")],
-            [InlineKeyboardButton(text="❌ Отменить заказ", callback_data="cancel_order")],
-            [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_main")]
-        ])
-        
-        await message.answer(items_text, reply_markup=keyboard)
+        # Переходим к сбору ФИО
+        await state.set_state(OrderStates.waiting_for_name)
+        items_text += "\nПожалуйста, введите ФИО полностью для оформления заказа:"
+        await message.answer(items_text)
         
     except Exception as e:
         logger.error(f"Ошибка обработки заказа: {e}")
@@ -504,6 +630,12 @@ async def process_order_from_catalog(message: types.Message, state: FSMContext):
 @router.callback_query(F.data == "calculate_delivery")
 async def process_calculate_delivery(callback: types.CallbackQuery, state: FSMContext):
     """Расчет доставки"""
+    data = await state.get_data()
+    if not all(k in data for k in ("customer_name", "customer_phone", "customer_address")):
+        # Если пользователь попал сюда без ввода данных — направим его
+        await callback.message.answer("Сначала укажем данные для отправки. Пожалуйста, введите ФИО:")
+        await state.set_state(OrderStates.waiting_for_name)
+        return
     delivery_text = """Варианты доставки
 
 📦 Почта России — 510 ₽ (5-7 дней, до 30 в регионы)  
@@ -524,6 +656,9 @@ async def process_delivery_selection(callback: types.CallbackQuery, state: FSMCo
     order_data = data['order_data']
     total_price = data['total_price']
     discount_amount = data['discount_amount']
+    customer_name = data.get('customer_name')
+    customer_phone = data.get('customer_phone')
+    customer_address = data.get('customer_address')
     
     # Рассчитываем итоговую стоимость
     delivery_price = delivery_info['price']
@@ -533,6 +668,9 @@ async def process_delivery_selection(callback: types.CallbackQuery, state: FSMCo
 Товар: {order_data['items'][0]['product_name']} · {order_data['items'][0]['size_name']}  
 Стоимость: {total_price} ₽  
 Доставка: {delivery_info['name']} · {delivery_price} ₽  
+Покупатель: {customer_name}  
+Телефон: {customer_phone}  
+Адрес: {customer_address}  
 -------------------  
 Итого к оплате: {final_price:.0f} ₽  
 
@@ -566,13 +704,21 @@ async def process_create_payment(callback: types.CallbackQuery, state: FSMContex
         final_price = data['final_price']
         delivery_method = data['delivery_method']
         delivery_price = data['delivery_price']
+        customer_name = data.get('customer_name')
+        customer_phone = data.get('customer_phone')
+        customer_address = data.get('customer_address')
         
         # Создаем заказ в базе данных
         with DatabaseManager.get_session() as db:
+            # Вкладываем данные клиента в items[0], чтобы не менять схему БД
+            items_enriched = [dict(order_data['items'][0])]
+            items_enriched[0]['customer_name'] = customer_name
+            items_enriched[0]['customer_phone'] = customer_phone
+            items_enriched[0]['customer_address'] = customer_address
             order = Order(
                 user_id=callback.from_user.id,
                 username=callback.from_user.username or "",
-                items=order_data['items'],
+                items=items_enriched,
                 delivery_method=delivery_method,
                 delivery_price=delivery_price,
                 total_price=final_price,
